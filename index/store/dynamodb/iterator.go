@@ -24,20 +24,27 @@ type PrefixIterator struct {
 }
 
 func (i *PrefixIterator) Seek(k []byte) {
-	//TODO: I wasn't sure whether it's required to seek if we've got a prefix iterator?
-	qo, err := i.store.db.Query(&dynamodb.QueryInput{
+	qi := &dynamodb.QueryInput{
+		TableName:              &i.store.tableName,
 		ConsistentRead:         aws.Bool(true),
-		KeyConditionExpression: aws.String("pk = :pk AND begins_with(sk, :prefix)"),
+		KeyConditionExpression: aws.String("#pk = :pk AND begins_with(#sk, :prefix)"),
 		ExpressionAttributeNames: map[string]*string{
-			"pk": aws.String("pk"),
-			"sk": aws.String("sk"),
+			"#pk": aws.String("pk"),
+			"#sk": aws.String("sk"),
 		},
 		ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{
 			":pk":     partitionKeyAttributeValue(i.store.partition),
-			":prefix": &dynamodb.AttributeValue{B: i.prefix},
+			":prefix": {B: i.prefix},
 		},
 		ExclusiveStartKey: i.lastEvaluatedKey,
-	})
+	}
+	if k != nil {
+		qi.KeyConditionExpression = aws.String("#pk = :pk AND #sk >= :k")
+		qi.ExpressionAttributeNames["#k"] = aws.String("k")
+		qi.ExpressionAttributeValues[":k"] = &dynamodb.AttributeValue{B: k}
+		qi.FilterExpression = aws.String("begins_with(#k, :prefix)")
+	}
+	qo, err := i.store.db.Query(qi)
 	if err != nil {
 		i.err = err
 		i.valid = false
@@ -47,20 +54,25 @@ func (i *PrefixIterator) Seek(k []byte) {
 	i.items = qo.Items
 	i.index = 0
 	i.valid = len(qo.Items) > 0
+	if i.valid {
+		item := i.items[i.index]
+		i.key = item["sk"].B
+		i.val, _ = recordToValue(item)
+		i.index++
+	}
 }
 
 func (i *PrefixIterator) Next() {
 	// There's no more items in the current page.
-	if i.index >= len(i.items) {
-		// If there's more pages to grab.
+	if i.index > len(i.items)-1 {
+		// Grab another page if there is one.
 		if !isKeyNullOrEmpty(i.lastEvaluatedKey) {
-			// Grab another page.
 			i.Seek(nil)
-			// If there's still no results, quit.
-			if i.index >= len(i.items) {
-				return
-			}
+			return
 		}
+		// If there isn't, we're finished.
+		i.valid = false
+		return
 	}
 	item := i.items[i.index]
 	i.key = item["sk"].B
@@ -86,5 +98,5 @@ func (i *PrefixIterator) Valid() bool {
 }
 
 func (i *PrefixIterator) Close() error {
-	return nil
+	return i.err
 }
